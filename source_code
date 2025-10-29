@@ -1,0 +1,139 @@
+import matplotlib.pyplot as plt
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.sql.types import DoubleType
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, VectorAssembler, Imputer, OneHotEncoder, StandardScaler
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+import pandas as pd
+import numpy as np
+
+# Start Spark
+spark = SparkSession.builder.appName("StudentPerformanceRisk").getOrCreate()
+# ------------------- LOAD DATA -------------------
+# If you don't have a CSV, use synthetic data
+np.random.seed(42)
+n = 100  # number of students
+df_synthetic = pd.DataFrame({
+    'student_id': range(1, n+1),
+    'age': np.random.randint(15, 20, size=n),
+    'studytime': np.random.randint(1, 5, size=n),
+    'failures': np.random.randint(0, 3, size=n),
+    'absences': np.random.randint(0, 20, size=n),
+    'school': np.random.choice(['GP', 'MS'], size=n),
+    'sex': np.random.choice(['M', 'F'], size=n),
+    'final_grade': np.random.randint(0, 101, size=n)
+})
+df_synthetic.to_csv('students.csv', index=False)
+
+# Load into Spark
+df = spark.read.csv('students.csv', header=True, inferSchema=True)
+
+# Display first 5 rows
+df.printSchema()
+df.show(5)
+# ------------------- CREATE LABEL -------------------
+# Students with final_grade < 40 are considered at-risk
+passing_threshold = 40.0
+df = df.withColumn('risk_label', (col('final_grade').cast(DoubleType()) < passing_threshold).cast('int'))
+
+# Check the data
+df.select('student_id', 'final_grade', 'risk_label').show(5)
+# Manually set columns based on your schema
+numeric_cols = ['student_id','age', 'studytime', 'failures', 'absences', 'final_grade']
+categorical_cols = ['school', 'sex']
+
+# Cast numeric columns to double
+for c in numeric_cols:
+    df = df.withColumn(c, col(c).cast('double'))
+
+print("Numeric columns:", numeric_cols)
+print("Categorical columns:", categorical_cols)
+# ------------------- PREPROCESSING -------------------
+stages = []
+
+# Numeric: impute missing values
+if numeric_cols:
+    imputer = Imputer(inputCols=numeric_cols, outputCols=[f"{c}_imputed" for c in numeric_cols])
+    stages.append(imputer)
+    numeric_assembled = [f"{c}_imputed" for c in numeric_cols]
+else:
+    numeric_assembled = []
+
+# Categorical: StringIndexer + OneHotEncoder
+ohe_output_cols = []
+for c in categorical_cols:
+    idx = StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid='keep')
+    stages.append(idx)
+    ohe = OneHotEncoder(inputCols=[f"{c}_idx"], outputCols=[f"{c}_ohe"])
+    stages.append(ohe)
+    ohe_output_cols.append(f"{c}_ohe")
+
+# Assemble features
+assembler_inputs = numeric_assembled + ohe_output_cols
+assembler = VectorAssembler(inputCols=assembler_inputs, outputCol='raw_features')
+stages.append(assembler)
+scaler = StandardScaler(inputCol='raw_features', outputCol='features')
+stages.append(scaler)
+
+# Classifier
+rf = RandomForestClassifier(labelCol='risk_label', featuresCol='features', probabilityCol='probability', seed=42)
+stages.append(rf)
+
+# Pipeline
+pipeline = Pipeline(stages=stages)
+# ------------------- TRAIN-TEST SPLIT -------------------
+train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+print(f"Training rows: {train_df.count()}, Test rows: {test_df.count()}")
+# ------------------- TRAIN MODEL -------------------
+model = pipeline.fit(train_df)
+print("Model training complete.")
+# ------------------- PREDICTIONS -------------------
+preds = model.transform(test_df)
+preds.select('student_id', 'risk_label', 'prediction', 'probability').show(5)
+# ------------------- EVALUATION -------------------
+evaluator = BinaryClassificationEvaluator(labelCol='risk_label', rawPredictionCol='rawPrediction', metricName='areaUnderROC')
+auc_value = evaluator.evaluate(preds)
+
+m_eval = MulticlassClassificationEvaluator(labelCol='risk_label', predictionCol='prediction')
+accuracy = m_eval.evaluate(preds, {m_eval.metricName: 'accuracy'})
+f1 = m_eval.evaluate(preds, {m_eval.metricName: 'f1'})
+
+print(f"AUC: {auc_value:.4f}, Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
+preds_pd = preds.select('student_id','risk_label', 'prediction', 'probability').toPandas()
+preds_pd['risk_prob'] = preds_pd['probability'].apply(lambda x: x[1])
+# 1️⃣ Histogram of predicted risk probabilities
+plt.hist(preds_pd['risk_prob'], bins=20, color='skyblue', edgecolor='black')
+plt.title('Predicted Risk Probabilities')
+plt.xlabel('Probability')
+plt.ylabel('Number of Students')
+plt.show()
+
+# 2️⃣ Confusion Matrix
+cm = confusion_matrix(preds_pd['risk_label'], preds_pd['prediction'])
+print("Confusion Matrix:\n", cm)
+
+# 3️⃣ ROC Curve
+fpr, tpr, _ = roc_curve(preds_pd['risk_label'], preds_pd['risk_prob'])
+roc_auc = auc(fpr, tpr)
+plt.plot(fpr, tpr, color='orange', label='ROC curve (AUC = %.2f)' % roc_auc)
+plt.plot([0,1],[0,1], color='gray', linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend()
+plt.show()
+
+# 4️⃣ Top 10 students at risk
+top_alerts = preds_pd.sort_values(by='risk_prob', ascending=False).head(10)
+plt.bar(range(len(top_alerts)), top_alerts['risk_prob'], color='red')
+plt.xticks(range(len(top_alerts)), top_alerts['student_id'].astype(str))
+plt.xlabel('Student ID')
+plt.ylabel('Risk Probability')
+plt.title('Top 10 Students at Risk')
+plt.show()
+# ------------------- STOP SPARK -------------------
+spark.stop()
+
